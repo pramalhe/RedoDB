@@ -16,6 +16,8 @@ Characteristics of RedoDB:
   * Can consume large amounts of persistent memory, but then again, so can MVCC;
   * This implementation is *not* production ready. This is research code, meant as a proof of concept that wait-free databases are possible and efficient;
   * Transactions in RedoDB are durable linearizable (serializable isolation);
+  * Write transactions don't scale, but read-only transactions scale well, irrespective of how many write transactions exist;
+  * The durability mechanism in RedoDB is not undo-log, nor redo-log, nor copy-on-write, it is multi-instace based (closer to Romulus);
 
 
 More instructions to come soon...
