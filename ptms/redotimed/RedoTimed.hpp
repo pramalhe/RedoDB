@@ -1,0 +1,1501 @@
+/*
+ * Copyright 2017-2020
+ *   Andreia Correia <andreia.veiga@unine.ch>
+ *   Pedro Ramalhete <pramalhe@gmail.com>
+ *   Pascal Felber <pascal.felber@unine.ch>
+ *
+ * This work is published under the MIT license. See LICENSE.txt
+ */
+#ifndef _REDOTIMED_PERSISTENCY_H_
+#define _REDOTIMED_PERSISTENCY_H_
+
+#include <atomic>
+#include <cstdint>
+#include <cassert>
+#include <string>
+#include <cstring>      // std::memcpy()
+#include <sys/mman.h>   // Needed if we use mmap()
+#include <sys/types.h>  // Needed by open() and close()
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>     // Needed by close()
+#include <linux/mman.h> // Needed by MAP_SHARED_VALIDATE
+#include <stdio.h>
+#include <iostream>
+#include <algorithm>
+#include <functional>
+#include <set>          // Needed by allocation statistics
+#include <type_traits>
+#include <chrono>
+
+#include "../../common/pfences.h"
+#include "../../common/ThreadRegistry.hpp"
+#include "../../common/StrongTryRIRWLock.hpp"
+#include "../../common/HazardPointers.hpp"
+
+using namespace std;
+using namespace chrono;
+
+
+// Size of the persistent memory region
+#ifndef PM_REGION_SIZE
+#define PM_REGION_SIZE (2*1024*1024*1024ULL) // 2GB by default (to run on laptop)
+#endif
+// DAX flag (MAP_SYNC) is needed for Optane but not for /dev/shm/
+#ifdef PM_USE_DAX
+#define PM_FLAGS       MAP_SYNC
+#else
+#define PM_FLAGS       0
+#endif
+// Name of persistent file mapping
+#ifndef PM_FILE_NAME
+#define PM_FILE_NAME   "/dev/shm/redotimed_shared"
+#endif
+
+
+/*
+ * <h1> Redo-Timed Persistent Transactional Memory </h1>
+ * A wait-free Persistent Transactional Memory.
+ * Memory usage can be up to MAX_THREADS+1 instances.
+ * Durability is given by multiple instances. Uses a volatile queue and volatile redo-log.
+ * Concurrency is given by Combineds with strong-try-locks.
+ * Uses a backoff mechanism.
+ */
+namespace redotimed {
+
+// Forward declaration to create a global instance
+class RedoTimed;
+extern RedoTimed gRedo;
+
+// Global with the 'main' size. Used by pload()
+extern uint64_t g_main_size;
+// Global with the 'main' addr. Used by pload()
+extern uint8_t* g_main_addr;
+extern uint8_t* g_main_addr_end;
+extern uint8_t* g_region_end;
+
+// Counter of nested write transactions
+extern thread_local int64_t tl_nested_write_trans;
+// Counter of nested read-only transactions
+extern thread_local int64_t tl_nested_read_trans;
+
+// Debug this in gdb with:
+// p lines[tid][(iline[tid]-0)%MAX_LINES]
+// p lines[tid][(iline[tid]-1)%MAX_LINES]
+// p lines[tid][(iline[tid]-2)%MAX_LINES]
+#define DEBUG_LINE() lines[tid][iline[tid]%MAX_LINES] = __LINE__; iline[tid]++;
+
+#define ADDR_IS_IN_MAIN(addr) ((uint8_t*)(addr) >= g_main_addr && (uint8_t*)(addr) < g_main_addr_end)
+#define ADDR_IS_IN_REGION(addr) ((addr) >= g_main_addr && (addr) < g_region_end)
+
+// Comment this out if we decide to go with Doug Lea's malloc
+#define USE_ESLOCO
+
+#ifdef USE_ESLOCO
+#include "../../common/EsLoco.hpp"
+#else // Use Doug Lea's malloc
+// This macro is used in Doug Lea's malloc to adjust weird castings that don't call the '&' operator
+#define CX_ADJUSTED_ADDR(addr) (ADDR_IS_IN_REGION(addr)) ? (malloc_chunk*)(addr - tlocal.tl_cx_size) : (malloc_chunk*)addr
+
+typedef void* mspace;
+extern void* mspace_malloc(mspace msp, size_t bytes);
+extern void mspace_free(mspace msp, void* mem);
+extern mspace create_mspace_with_base(void* base, size_t capacity, int locked);
+#endif
+
+
+// Define this in the Makefile if you want to measure the relative time of each task
+#ifdef MEASURE_FUNC_TIMES
+#define START_TIME()    auto _startTime = steady_clock::now();
+#define START_TIMEST()  auto _sTime     = steady_clock::now();
+#define END_TIME(_x)    auto _endTime   = steady_clock::now(); tlocal.funcTime[_x] += (_endTime-_startTime);
+#define END_TIMEST(_x)  auto _eTime     = steady_clock::now(); tlocal.funcTime[_x] += (_eTime-_sTime);
+#define END_TIMEF(_x)   auto _enTime    = steady_clock::now(); tlocal.funcTime[_x] += (_enTime-_startTime);
+#else
+#define START_TIME()
+#define START_TIMEST()
+#define END_TIME(_x)
+#define END_TIMEST(_x)
+#define END_TIMEF(_x)
+#endif // MEASURE_FUNC_TIMES
+
+
+// Returns the cache line of the address (this is for x86 only)
+#define ADDR2CL(_addr) (uint8_t*)((size_t)(_addr) & (~63ULL))
+extern std::atomic<uint64_t> printlock;
+
+struct varLocal {
+    void* st{};
+    uint64_t tl_cx_size{0};
+    int64_t tl_nested_write_trans{0};
+    int64_t tl_nested_read_trans{0};
+    bool copy;
+#ifdef MEASURE_FUNC_TIMES
+    const char* funcName[13] {"copy","flushCopy","AggrStores","AggrCL","AggrCLPWBs","flushDeferredPWBs","apply_undolog","apply_redologs","lambdas","Sleeping","getNewComb","publishRequest","writeTx"};
+    nanoseconds funcTime[13] {0ns,0ns,0ns,0ns,0ns,0ns,0ns,0ns,0ns,0ns,0ns,0ns,0ns};
+    ~varLocal(){
+        uint64_t tmp =0;
+        while(!printlock.compare_exchange_strong(tmp, 1)){tmp=0;}
+        for(int i=0;i<13;i++){
+            printf(" %s=, %ld, ",funcName[i],funcTime[i].count());
+        }
+        printf("\n");
+        printlock.store(0);
+    }
+#endif
+};
+
+extern thread_local varLocal tlocal;
+
+/*
+ * Definition of persist<> type.
+ * We interpose loads to adjust the synthetic pointers and interpose stores to log them
+ */
+template<typename T> struct persist {
+    // Stores the actual value
+    T val;
+
+    persist() { }
+
+    persist(T initVal) { pstore(initVal); }
+
+    // Casting operator
+    operator T() { return pload(); }
+
+    // Casting to const
+    operator T() const { return pload(); }
+
+    // Prefix increment operator: ++x
+    void operator++ () { pstore(pload()+1); }
+    // Prefix decrement operator: --x
+    void operator-- () { pstore(pload()-1); }
+    void operator++ (int) { pstore(pload()+1); }
+    void operator-- (int) { pstore(pload()-1); }
+    persist<T>& operator+= (const T& rhs) { pstore(pload() + rhs); return *this; }
+    persist<T>& operator-= (const T& rhs) { pstore(pload() - rhs); return *this; }
+
+    // Equals operator
+    template <typename Y, typename = typename std::enable_if<std::is_convertible<Y, T>::value>::type>
+    bool operator == (const persist<Y> &rhs) { return pload() == rhs; }
+    // Difference operator: first downcast to T and then compare
+    template <typename Y, typename = typename std::enable_if<std::is_convertible<Y, T>::value>::type>
+    bool operator != (const persist<Y> &rhs) { return pload() != rhs; }
+    // Relational operators
+    template <typename Y, typename = typename std::enable_if<std::is_convertible<Y, T>::value>::type>
+    bool operator < (const persist<Y> &rhs) { return pload() < rhs; }
+    template <typename Y, typename = typename std::enable_if<std::is_convertible<Y, T>::value>::type>
+    bool operator > (const persist<Y> &rhs) { return pload() > rhs; }
+    template <typename Y, typename = typename std::enable_if<std::is_convertible<Y, T>::value>::type>
+    bool operator <= (const persist<Y> &rhs) { return pload() <= rhs; }
+    template <typename Y, typename = typename std::enable_if<std::is_convertible<Y, T>::value>::type>
+    bool operator >= (const persist<Y> &rhs) { return pload() >= rhs; }
+
+    // Operator arrow ->
+    T operator->() { return pload(); }
+
+    // Copy constructor
+    persist<T>(const persist<T>& other) { pstore(other.pload()); }
+
+    // Assignment operator from a persist<>
+    persist<T>& operator=(const persist<T>& other) {
+        pstore(other.pload());
+        return *this;
+    }
+
+    // Assignment operator from a value
+    persist<T>& operator=(T value) { pstore(value); return *this; }
+    // Logical+assignment operations from a value
+    persist<T>& operator&=(T value) { pstore(pload() & value); return *this; }
+    persist<T>& operator|=(T value) { pstore(pload() | value); return *this; }
+    persist<T>& operator+=(T value) { pstore(pload() + value); return *this; }
+    persist<T>& operator-=(T value) { pstore(pload() - value); return *this; }
+
+    // Operator &
+    inline T* operator&() {
+        uint8_t* valaddr = (uint8_t*)&val;
+        if (ADDR_IS_IN_REGION(valaddr) && !ADDR_IS_IN_MAIN(valaddr)) {
+            return reinterpret_cast<T*>( valaddr - tlocal.tl_cx_size );
+        }
+        return &val;
+    }
+
+    // Defined later due to dependencies
+    inline void pstore(T newVal);
+
+    inline T pload() const {
+        uint8_t* valaddr = (uint8_t*)&val;
+        const uint64_t cx_size = tlocal.tl_cx_size;
+        // This handles the case of nested persist<>
+        if (cx_size != 0 && ADDR_IS_IN_MAIN(valaddr)) {
+            return *reinterpret_cast<T*>( valaddr + cx_size );
+        } else {
+            return val;
+        }
+    }
+};
+
+
+typedef uint64_t SeqTidIdx;
+
+class RedoTimed {
+    int NUM_CORES = 0;
+    const int MAX_COMBS = 2;
+    static const int MAX_READ_TRIES = 10; // Maximum number of times a reader will fail to acquire the shared lock before adding its operation as a mutation
+    static const int MAX_THREADS = 41;
+    static const int MAX_COMBINEDS = MAX_THREADS+1;
+    static const int NUM_OBJS = 100;
+    static const int MAXLOGSIZE = 256;
+    static const int RINGSIZE = 16192;
+    static const int STATESSIZE = 2096;
+    // Constants for SeqTidIdx. They must sum to 64 bits
+    static const int SEQ_BITS = 44;
+    static const int TID_BITS = 8;   // Can't have more than 256 threads (should be enough for now)
+    static const int IDX_BITS = 12;  // WARNING: ring capacity up to 4098
+    const int maxThreads;
+    static const uint64_t HASH_BUCKETS = 256;
+
+
+    // Check that multiple parameters are valid
+    static void checkParams() {
+        if (MAX_THREADS > REGISTRY_MAX_THREADS) {
+            printf("MAX_THREADS (%d) is lower than registry size (%d). Please increase REGISTRY_MAX_THREADS\n",
+                    MAX_THREADS, REGISTRY_MAX_THREADS);
+            assert(false);
+        }
+        if (REGISTRY_MAX_THREADS >= (1ULL << TID_BITS)) {
+            printf("Registry size (%d) is larger than capacity of TID_BITS (%ld). Please increase TID_BITS\n",
+                    REGISTRY_MAX_THREADS, (1UL << TID_BITS));
+            assert(false);
+        }
+        if (SEQ_BITS + TID_BITS + IDX_BITS != 64) {
+            printf("Bits in SeqTidIdx don't sum to 64. Please adjust SEQ_BITS (%d) or TID_BITS (%d) or IDX_BITS (%d)\n",
+                    SEQ_BITS, TID_BITS, IDX_BITS);
+            assert(false);
+        }
+        if (STATESSIZE >= (1UL << IDX_BITS)) {
+            printf("STATESSIZE (%d) is too large to be addressed by IDX_BITS (%d). Please increase IDX_BITS\n",
+                    STATESSIZE, IDX_BITS);
+            assert(false);
+        }
+    }
+
+
+    // Used for debugging only
+    //static const int MAX_LINES = 256;
+    //uint64_t lines[MAX_THREADS][MAX_LINES];
+    //uint64_t iline[MAX_THREADS] {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+
+    // Class to combine head and the instance.
+    struct Combined {
+        std::atomic<SeqTidIdx>     head {0};
+        uint8_t*                   root {nullptr}; //offset in bytes
+        StrongTryRIRWLock          rwLock {MAX_THREADS};
+        bool                       flushcopy{false};
+    };
+
+    // A single entry in the write-set
+    struct WriteSetEntry {
+        uint8_t*       addr {nullptr};      // Address of value+sequence to change
+        uint64_t       oldval {0};          // Previous value
+        uint64_t       val {0};             // Desired value to change to
+        WriteSetEntry*        next {nullptr};
+    };
+
+    // A single entry in the write-set
+    struct WriteSetNode {
+        WriteSetEntry*     buckets[MAXLOGSIZE];
+        WriteSetEntry      log[MAXLOGSIZE];     // Redo log of stores
+        WriteSetNode*      next {nullptr};
+        WriteSetNode*      prev {nullptr};
+
+        WriteSetNode() {
+            for (int i = 0; i < MAXLOGSIZE; i++) buckets[i] = &log[MAXLOGSIZE-1];
+        }
+    };
+
+    struct WriteSetCL {
+        uint8_t*           addrCL {nullptr};
+        WriteSetCL*        next {nullptr};
+    };
+
+    // A single entry in the write-set
+    struct WriteSetNodeCL {
+        WriteSetCL*        buckets[HASH_BUCKETS];  // HashMap for CLWBs
+        WriteSetCL         log[HASH_BUCKETS];     // Redo log of stores
+        WriteSetNodeCL*    next {nullptr};
+        WriteSetNodeCL*    prev {nullptr};
+        WriteSetNodeCL() {
+            for (int i = 0; i < HASH_BUCKETS; i++) buckets[i] = &log[HASH_BUCKETS-1];
+        }
+    };
+
+    // Returns a uint64_t that is the combination of the Sequence, the Tid and Index
+    inline static SeqTidIdx makeSeqTidIdx(const uint64_t seq, const uint64_t tid, const uint64_t idx) {
+        return (seq << (TID_BITS+IDX_BITS)) | (tid << IDX_BITS) | idx;
+    }
+    // Returns the Sequence in a SeqTidIdx
+    inline static uint64_t sti2seq(const SeqTidIdx sti) {
+        return sti >> (TID_BITS+IDX_BITS);
+    }
+    // Returns the Tid in a SeqTidIdx
+    inline static uint64_t sti2tid(const SeqTidIdx sti) {
+        return (sti >> (IDX_BITS)) & ((1 << TID_BITS)-1);
+    }
+    // Returns the Idx in a SeqTidIdx
+    inline static uint64_t sti2idx(const SeqTidIdx sti) {
+        return sti & ((1 << IDX_BITS)-1);
+    }
+
+
+public:
+
+    class State {
+    public:
+        std::atomic<SeqTidIdx> ticket {0};
+        std::atomic<bool>      applied[MAX_THREADS];
+        std::atomic<uint64_t>  results[MAX_THREADS];
+        WriteSetNode           logHead {};
+        WriteSetNode*          logTail {nullptr};
+        uint64_t               lSize = 0;
+        std::atomic<uint64_t>  logSize {0};
+
+        WriteSetNodeCL         logHeadCL {};
+        WriteSetNodeCL*        logTailCL {nullptr};
+        uint64_t               numCL = 0;
+
+        State() { // Used only by the first objState instance
+            logTail = &logHead;
+            logTailCL = &logHeadCL;
+            for (int i = 0; i < MAX_THREADS; i++) applied[i].store(false);
+            for (int i = 0; i < MAX_THREADS; i++) results[i].store(0);
+        }
+        ~State() {
+            WriteSetNode* node = logHead.next;
+            WriteSetNode* delNode = node;
+            while(node!=nullptr){
+                node = node->next;
+                delete delNode;
+                delNode = node;
+            }
+
+            WriteSetNodeCL* nodeCL = logHeadCL.next;
+            WriteSetNodeCL* delNodeCL = nodeCL;
+            while(nodeCL!=nullptr){
+                nodeCL = nodeCL->next;
+                delete delNodeCL;
+                delNodeCL = nodeCL;
+            }
+        }
+
+        // We can't use the "copy assignment operator" because we need to make sure that the instance
+        // we're copying is the one we have protected with the hazard pointer
+        void copyFrom(const State* from) {
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            //const uint64_t numThreads = ThreadRegistry::getMaxThreads();
+            for (int i = 0; i < MAX_THREADS; i++) applied[i].store(from->applied[i].load(std::memory_order_relaxed), std::memory_order_relaxed);
+            for (int i = 0; i < MAX_THREADS; i++) results[i].store(from->results[i].load(std::memory_order_relaxed), std::memory_order_relaxed);
+        }
+    };
+
+private:
+    struct States {
+        State*        states;
+        uint64_t      lastIdx{1};
+        States() {
+            states = new State[STATESSIZE];
+        }
+        ~States() {
+            delete[] states;
+        }
+    };
+
+    inline void apply_undolog(State* state) noexcept {
+        START_TIME();
+        WriteSetNode* node = state->logTail;
+        int len = state->lSize;
+        int j=0;
+        if(len>0){
+            uint64_t offset = tlocal.tl_cx_size;
+            len = len%MAXLOGSIZE;
+            if(len == 0) len = MAXLOGSIZE;
+            while(node!=nullptr){
+                for(int i=len-1;i>=0;i--){
+                    WriteSetEntry* entry = &node->log[i];
+                    *(uint64_t*)( entry->addr + offset ) = entry->oldval;
+                    j++;
+                }
+                node = node->prev;
+                len=MAXLOGSIZE;
+            }
+        }
+        END_TIME(6);
+    }
+
+
+    inline void copy_redolog(State* state, uint64_t redoSize, int tid, const uint64_t offset) noexcept {
+        WriteSetNode* node= &state->logHead;
+        int j=0;
+        int len = MAXLOGSIZE;
+        while(true){
+            if(redoSize-j<MAXLOGSIZE) {
+                len = redoSize%MAXLOGSIZE;
+            }
+            for(int i=0;i<len;i++){
+                WriteSetEntry e = node->log[i];
+                if(!ADDR_IS_IN_MAIN(e.addr)) return;
+                *(uint64_t*)(e.addr + offset) = e.val;
+                j++;
+            }
+            if(j>=redoSize) return;
+            node = node->next;
+        }
+    }
+
+    inline Combined* apply_redologs(Combined* newComb, uint64_t initCombSeq, SeqTidIdx lastAppliedTicket, SeqTidIdx ltail, int tid) noexcept {
+        START_TIME();
+        uint64_t start = sti2seq(lastAppliedTicket);
+        uint64_t i = start+1;
+        uint64_t lastSeq = sti2seq(ltail);
+        SeqTidIdx ringTicket;
+        if(lastSeq-start>RINGSIZE) {
+            if(!makeCopy(newComb, tid)) return nullptr;
+            return newComb;
+        }
+        const uint64_t offset = tlocal.tl_cx_size;
+        for(;i<=lastSeq;i++){
+            ringTicket = ring[i%RINGSIZE].load();
+            if(i != sti2seq(ringTicket)) break;
+            State* apply_state = &sauron[sti2tid(ringTicket)].states[sti2idx(ringTicket)];
+
+            const uint64_t redoSize = apply_state->logSize.load();
+
+            if(redoSize > 0){
+                copy_redolog(apply_state, redoSize, tid, offset);
+                atomic_thread_fence(std::memory_order_acquire);
+                if (ringTicket != apply_state->ticket.load()) {
+                    break;
+                }
+
+                flushDeferredPWBs(apply_state);
+            }
+
+            if(sti2seq(per->curComb.load())>=initCombSeq+2){
+                PFENCE();
+                newComb->head.store(ringTicket,std::memory_order_relaxed);
+                END_TIME(7);
+                return nullptr;
+            }
+        }
+        END_TIME(7);
+        // Failed to apply redo log so make a copy
+        if(i != lastSeq+1){
+            if(!makeCopy(newComb, tid)) return nullptr;
+        }else{
+            PFENCE();
+            newComb->head.store(ringTicket,std::memory_order_relaxed);
+        }
+        return newComb;
+    }
+
+    // One Ring to Rule them all...
+    alignas(128) States* sauron;
+    alignas(128) std::atomic<SeqTidIdx>* ring;
+    // Array of Combined instances, size MAX_THREADS+1
+    alignas(128) Combined* combs;
+    // Enqueue requests. Use by Herlihy's combining consensus
+    alignas(128) std::atomic<std::function<uint64_t()>*> enqueuers[MAX_THREADS];
+    alignas(128) std::atomic<bool>                       announce[MAX_THREADS];
+
+    // We need one hazard pointer to protect the std::function published in enqueuers[]
+    HazardPointers<std::function<uint64_t()>> hpMut {1, maxThreads};
+    const int kHpMut     = 0;
+
+    // Latest measurements of copy time
+    alignas(128) std::atomic<microseconds> copyTime {100000us};
+
+    inline int getCombined(const int tid) {
+        SeqTidIdx initComb = per->curComb.load();
+        const int initCombSeq = sti2seq(initComb);
+        // 3 instead of 2 to avoid PFENCE when reading curComb
+        for (int i = 0; i < 2; i++) {
+            SeqTidIdx cComb = per->curComb.load();
+            if(sti2seq(cComb) >= initCombSeq+2) break;
+            const int curCombIndex = sti2idx(cComb);
+            Combined* lcomb = &combs[curCombIndex];
+            if (!lcomb->rwLock.sharedTryLock(tid)) continue;
+            if (cComb == per->curComb.load()) return curCombIndex;
+            lcomb->rwLock.sharedUnlock(tid);
+        }
+        return -1;
+    }
+
+
+
+    // Id for sanity check
+    static const uint64_t MAGIC_ID = 0x1337BAB8;
+
+    // Filename for the mapping file
+    const char* MMAP_FILENAME = PM_FILE_NAME;
+
+    // Member variables
+    bool dommap;
+    int fd = -1;
+    uint8_t* base_addr;
+    uint64_t max_size;
+
+    // One instance of this is at the start of base_addr, in persistent memory
+    struct PersistentHeader {
+        uint64_t           id {0}; //validation
+        std::atomic<SeqTidIdx>   curComb {0};
+        persist<void*>*    objects {nullptr};   // directory
+#ifdef USE_ESLOCO
+        void*              mspadd;
+#else
+        mspace             ms {};
+#endif
+        uint8_t            padding[1024-32]; // padding so that PersistentHeader size is 1024 bytes
+    };
+
+    PersistentHeader* per {nullptr};
+
+#ifdef USE_ESLOCO
+    EsLoco<persist> esloco {};
+#endif
+
+    // Set to true to get a report of leaks on the destructor
+    bool enableAllocStatistics = false;
+
+    struct AStats {
+        void*    addr;
+        uint64_t size;
+        AStats(void* addr, uint64_t size) : addr{addr}, size{size} {}
+        bool operator < (const AStats& rhs) const {
+            return addr < rhs.addr;
+        }
+    };
+
+    std::set<AStats> statsSet {};
+    uint64_t statsAllocBytes {0};
+    uint64_t statsAllocNum {0};
+
+
+    // Flush touched cache lines
+    inline void flush_range(uint8_t* addr, size_t length) {
+        const int cache_line_size = 64;
+        uint8_t* ptr = addr;
+        uint8_t* last = addr + length;
+        for (; ptr < last; ptr += cache_line_size) PWB(ptr);
+    }
+
+
+    // Copy a range to a persistent memory region using memcpy. Flushing is done in flushCopy().
+    // Stop the copy and return false if the curComb changes in the mean time.
+    // Measure the time it takes to make the copy and save it in 'copyTime'.
+    bool copyFromTo(uint8_t* from , uint8_t* to, int fromIdx, uint64_t initComb, int tid) {
+        auto startTime = steady_clock::now();
+        uint8_t* _from = from;
+        uint8_t* _to = to;
+        uint64_t lcxsize  = tlocal.tl_cx_size;
+        tlocal.tl_cx_size = fromIdx * g_main_size;
+        uint64_t usedSize = esloco.getUsedSize();
+        tlocal.tl_cx_size = lcxsize;
+        uint64_t size     = usedSize;
+        uint64_t copySize = 16*1024;  // We copy 16kB at a time
+        // Copy
+        while (size > 0) {
+            if (copySize > size) copySize = size;
+            std::memcpy(_to, _from, copySize);
+            if (per->curComb.load(std::memory_order_acquire) != initComb) return false;
+            size = size - copySize;
+            _to = _to+copySize;
+            _from = _from+copySize;
+        }
+        // This fence prevents reordering between per->curComb.load() and std::memcpy(_to, _from, copySize)
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        if (per->curComb.load() != initComb) return false;
+        auto endTime = steady_clock::now();
+        microseconds timeus = duration_cast<microseconds>(endTime-startTime);
+        copyTime.store(timeus, std::memory_order_release);
+        return true;
+    }
+
+
+    // Execute the pwbs to flush after a copy. Return false if the curComb changes in the meantime.
+    bool flushCopy(uint8_t* to, uint64_t usedSize) {
+        SeqTidIdx curC = per->curComb.load();
+        uint64_t initCombSeq = sti2seq(curC);
+        uint64_t size = usedSize;
+        // We flush in chunks of 512 bytes and check the curComb in between
+        uint64_t flushSize = 512;
+        while (size > 0) {
+            if (flushSize > size) flushSize = size;
+            flush_range(to, flushSize);
+            SeqTidIdx cComb = per->curComb.load();
+            if (cComb != curC) {
+                // Stop if the curComb has advanced two times or more
+                if (sti2seq(cComb) >= initCombSeq+2) break;
+                Combined* lcomb = &combs[sti2idx(cComb)];
+                SeqTidIdx ltail = lcomb->head.load();
+                if (cComb != per->curComb.load()) break;
+                const int tid = ThreadRegistry::getTID();
+                bool an = announce[tid].load(std::memory_order_relaxed);
+                if (an == sauron[sti2tid(ltail)].states[sti2idx(ltail)].applied[tid].load()) {
+                    if (cComb == per->curComb.load()) break;
+                }
+                curC = cComb;
+            }
+            size = size - flushSize;
+            to = to+flushSize;
+        }
+        if (size > 0) return false;
+        return true;
+    }
+
+
+public:
+
+    inline void flushDeferredPWBs(State* state) {
+        START_TIME();
+        if(state->numCL==0) return;
+        int numCLnodes = (state->numCL%HASH_BUCKETS==0)?state->numCL/HASH_BUCKETS:state->numCL/HASH_BUCKETS+1;
+        WriteSetNodeCL* nodeCL = &state->logHeadCL;
+
+        int size = HASH_BUCKETS;
+        for(int i=0;i<numCLnodes;i++){
+            if(i==numCLnodes-1){
+                if(state->numCL%HASH_BUCKETS!=0){
+                    size = state->numCL%HASH_BUCKETS;
+                }
+            }
+            //printf("size %d \n",size);
+            for (int k = 0; k < size; k++) {
+                //printf("%p %ld \n",nodeCL->log[k].addrCL,tlocal.tl_cx_size);
+                PWB(nodeCL->log[k].addrCL + tlocal.tl_cx_size);
+            }
+            nodeCL = nodeCL->next;
+        }
+        END_TIME(5);
+    }
+
+    // Each cl on a different bucket
+    inline uint64_t hashAddress(const void* addr) const {
+        return ((uint64_t)addr>>3) % MAXLOGSIZE;
+    }
+
+    inline void addAddress(WriteSetNode* tail, uint64_t lSize, uint8_t* addr,
+            uint64_t oldval, uint64_t val, const uint64_t hashAddr, WriteSetEntry* next){
+
+        WriteSetEntry* e = &tail->log[lSize%MAXLOGSIZE];
+        e->addr = (uint8_t*)addr;
+        e->oldval = oldval;
+        e->val = val;
+        // Clear if entry is from previous tx
+        e->next = next;
+        tail->buckets[hashAddr] = e;
+    }
+
+    /*
+     * @return false if address is already present otherwise true
+     */
+    inline bool addAddrIfAbsent(State* state, void* addr, uint64_t oldval, uint64_t val) noexcept {
+        const uint64_t hashAddr = hashAddress(addr);
+        WriteSetNode* tail = state->logTail;
+        uint64_t lSize = state->lSize;
+        const int tid = ThreadRegistry::getTID();
+        if(lSize==0){
+            addAddress(tail, lSize, (uint8_t*)addr, oldval, val, hashAddr,nullptr);
+            state->lSize=lSize+1;
+            return true;
+        }
+        WriteSetNode* node = tail;
+        if(lSize%MAXLOGSIZE==0){
+
+            for(int i=0;i<lSize/MAXLOGSIZE;i++){
+                if(i==16) break; //limit search to last 16 nodes of State
+                WriteSetEntry* be = node->buckets[hashAddr];
+                if(hashAddress(be->addr) == hashAddr){
+                    while (be != nullptr) {
+                        if (be->addr == addr) {
+                            be->val = val;
+                            return false;
+                        }
+                        be = be->next;
+                    }
+                }
+                node = node->prev;
+            }
+
+            WriteSetNode* next = tail->next;
+            if(next ==nullptr){
+                next = new WriteSetNode();
+                tail->next = next;
+                next->prev = tail;
+            }else{
+                for (int i = 0; i < MAXLOGSIZE; i++) next->buckets[i] = &next->log[MAXLOGSIZE-1];
+            }
+            tail = next;
+            state->logTail = next;
+
+        }else{
+
+            int numNodes = lSize/MAXLOGSIZE +1;
+            for(int i=0;i<numNodes;i++){
+                if(i==16) break;
+                WriteSetEntry* be = node->buckets[hashAddr];
+                if(hashAddress(be->addr) != hashAddr){
+                    node = node->prev;
+                    continue;
+                }
+
+                if(i != 0 ||
+                        (i == 0 &&
+                                be < &node->log[lSize%MAXLOGSIZE] && hashAddress(be->addr) == hashAddr)){
+
+                    while (be != nullptr) {
+                        if (be->addr == addr) {
+                            be->val = val;
+                            return false;
+                        }
+                        be = be->next;
+                    }
+                }
+                node = node->prev;
+            }
+        }
+        WriteSetEntry* e = &tail->log[lSize%MAXLOGSIZE];
+        WriteSetEntry* be = tail->buckets[hashAddr];
+        // Clear if entry is from previous tx
+        WriteSetEntry* next = (be < e && hashAddress(be->addr) == hashAddr) ? be : nullptr;
+        //WriteSetEntry* next = tail->buckets[hashAddr];
+        addAddress(tail, lSize, (uint8_t*)addr, oldval, val, hashAddr,next);
+        state->lSize=lSize+1;
+        return true;
+    }
+
+    // Each cl on a different bucket
+    inline uint64_t hash(const void* addr) const {
+        return (((uint64_t)addr) >> 6) % HASH_BUCKETS;
+    }
+
+    // add a new cache line to the hashmap is not present
+    inline void addIfAbsent(State* state, void* addr) {
+        uint8_t* cl = ADDR2CL(addr);
+        const uint64_t hashAddr = hash(cl);
+        WriteSetNodeCL* tail = state->logTailCL;
+        uint64_t numCL = state->numCL;
+        if(numCL==0){
+            WriteSetCL* e = &tail->log[numCL];
+
+            e->addrCL = cl;
+            //printf("addrCL %p %p \n",e->addrCL,addr);
+            e->next = nullptr;
+            tail->buckets[hashAddr] = e;
+            state->numCL++;
+            return;
+        }
+
+        if(numCL+1>esloco.getUsedSize()/64) {
+            tlocal.copy = true;
+            return;
+        }
+
+        WriteSetNodeCL* node = tail;
+
+        if(numCL%HASH_BUCKETS==0){
+            for(int i=0;i<numCL/HASH_BUCKETS;i++){
+                if(i==16) break;
+                WriteSetCL* be = node->buckets[hashAddr];
+                if(hash(be->addrCL) != hashAddr){
+                    be = nullptr;
+                }
+                while (be != nullptr) {
+                    if (be->addrCL == cl) {
+                        return;
+                    }
+                    be = be->next;
+                }
+                node = node->prev;
+            }
+            WriteSetNodeCL* next = tail->next;
+            if(next ==nullptr){
+                next = new WriteSetNodeCL();
+                tail->next = next;
+                next->prev = tail;
+            }
+            tail = next;
+            state->logTailCL = next;
+
+
+        }else{
+            int numCLnodes = numCL/HASH_BUCKETS +1;
+            for(int i=0;i<numCLnodes;i++){
+                if(i==16) break;
+                WriteSetCL* be = node->buckets[hashAddr];
+                if(hash(be->addrCL) != hashAddr){
+                    node = node->prev;
+                    continue;
+                }
+                if(i!=0 ||
+                        (i == 0 && be < &node->log[numCL%HASH_BUCKETS]
+                                                   && hash(be->addrCL) == hashAddr)){
+                    while (be != nullptr) {
+                        if (be->addrCL == cl) {
+                            return;
+                        }
+                        be = be->next;
+                    }
+                }
+                node = node->prev;
+            }
+        }
+
+
+        WriteSetCL* e = &tail->log[numCL%HASH_BUCKETS];
+
+        e->addrCL = cl;
+        //printf("addrCL %p %p \n",e->addrCL,addr);
+        // Add to hashmap
+        WriteSetCL* be = tail->buckets[hashAddr];
+        // Clear if entry is from previous tx
+        e->next = (be < e && hash(be->addrCL) == hashAddr) ? be : nullptr;
+        tail->buckets[hashAddr] = e;
+        state->numCL++;
+    }
+
+
+    RedoTimed() : dommap{true},maxThreads{MAX_THREADS}{
+        sauron = new States[maxThreads];
+        ring = new std::atomic<SeqTidIdx>[RINGSIZE];
+        for(int i=0;i<RINGSIZE;i++) ring[i] = 0;
+        combs = new Combined[MAX_COMBINEDS];
+        for (int i = 0; i < maxThreads; i++) enqueuers[i].store(nullptr, std::memory_order_relaxed);
+        for (int i = 0; i < maxThreads; i++) announce[i].store(false, std::memory_order_relaxed);
+        NUM_CORES = std::thread::hardware_concurrency();
+        checkParams();
+
+        if (dommap) {
+            base_addr = (uint8_t*)0x7fddc0000000;
+            max_size = PM_REGION_SIZE + 1024;
+            // Check if the file already exists or not
+            struct stat buf;
+            if (stat(MMAP_FILENAME, &buf) == 0) {
+                // File exists
+                //std::cout << "Re-using memory region\n";
+                fd = open(MMAP_FILENAME, O_RDWR|O_CREAT, 0755);
+                assert(fd >= 0);
+                // mmap() memory range
+                uint8_t* got_addr = (uint8_t *)mmap(base_addr, max_size, (PROT_READ | PROT_WRITE), MAP_SHARED_VALIDATE | PM_FLAGS, fd, 0);
+                if (got_addr == MAP_FAILED || got_addr != base_addr) {
+                    perror("ERROR: mmap() is not working !!! ");
+                    printf("got_addr = %p instead of %p\n", got_addr, base_addr);
+                    assert(false);
+                }
+                per = reinterpret_cast<PersistentHeader*>(base_addr);
+                if(per->id != MAGIC_ID) createFile();
+                g_main_size = (max_size - sizeof(PersistentHeader))/MAX_COMBINEDS;
+                g_main_addr = base_addr + sizeof(PersistentHeader);
+                g_main_addr_end = g_main_addr + g_main_size;
+                g_region_end = g_main_addr +MAX_COMBINEDS*g_main_size;
+
+                uint64_t combidx = sti2idx(per->curComb.load());
+                for(int i = 0; i < MAX_COMBINEDS; i++){
+                    combs[i].root = g_main_addr + i*g_main_size;
+                    if(i!=combidx){
+                        combs[i].head.store(makeSeqTidIdx(0, 1, 0),std::memory_order_relaxed);
+                    }else{
+                        combs[i].head.store(0,std::memory_order_relaxed);
+                    }
+                }
+                Combined* comb = &combs[combidx];
+                comb->rwLock.setReadLock();
+                per->curComb.store(makeSeqTidIdx(0, 0, combidx));
+
+#ifdef USE_ESLOCO
+                esloco.init(g_main_addr, g_main_size, false);
+#endif
+            } else {
+                createFile();
+            }
+        }
+    }
+
+
+    void createFile(){
+        // File doesn't exist
+        fd = open(MMAP_FILENAME, O_RDWR|O_CREAT, 0755);
+        assert(fd >= 0);
+        if (lseek(fd, max_size-1, SEEK_SET) == -1) {
+            perror("lseek() error");
+        }
+        if (write(fd, "", 1) == -1) {
+            perror("write() error");
+        }
+        // mmap() memory range
+        uint8_t* got_addr = (uint8_t *)mmap(base_addr, max_size, (PROT_READ | PROT_WRITE), MAP_SHARED_VALIDATE | PM_FLAGS, fd, 0);
+        if (got_addr == MAP_FAILED || got_addr != base_addr) {
+            perror("ERROR: mmap() is not working !!! ");
+            printf("got_addr = %p instead of %p\n", got_addr, base_addr);
+            assert(false);
+        }
+        // No data in persistent memory, initialize
+        per = new (base_addr) PersistentHeader;
+        g_main_size = (max_size - sizeof(PersistentHeader))/MAX_COMBINEDS;
+        g_main_addr = base_addr + sizeof(PersistentHeader);
+        g_main_addr_end = g_main_addr + g_main_size;
+        g_region_end = g_main_addr +MAX_COMBINEDS*g_main_size;
+        PWB(&per->curComb);
+
+        for(int i = 0; i < MAX_COMBINEDS; i++){
+            combs[i].root = g_main_addr + i*g_main_size;
+        }
+        Combined* comb = &combs[sti2idx(per->curComb.load())];
+        comb->rwLock.setReadLock();
+        updateTx<bool>([&] () {
+#ifdef USE_ESLOCO
+            esloco.init(g_main_addr, g_main_size, true);
+            per->objects = (persist<void*>*)esloco.malloc(sizeof(void*)*NUM_OBJS);
+#else
+            per->ms = create_mspace_with_base(g_main_addr, g_main_size, false);
+            per->objects = (persist<void*>*)mspace_malloc(per->ms, sizeof(void*)*NUM_OBJS);
+#endif
+            for (int i = 0; i < NUM_OBJS; i++) {
+                per->objects[i] = nullptr;
+            }
+            return true;
+        });
+        PFENCE();
+        per->id = MAGIC_ID;
+        PWB(&per->id);
+        PSYNC();
+    }
+
+
+    ~RedoTimed() {
+        delete[] sauron;
+        delete[] ring;
+        delete[] combs;
+
+        // Must do munmap() if we did mmap()
+        if (dommap) {
+            //destroy_mspace(ms);
+            munmap(base_addr, max_size);
+            close(fd);
+        }
+        if (enableAllocStatistics) { // Show leak report
+            std::cout << "RedoTimed: statsAllocBytes = " << statsAllocBytes << "\n";
+            std::cout << "RedoTimed: statsAllocNum = " << statsAllocNum << "\n";
+        }
+    }
+
+    static std::string className() { return "RedoTimedPTM"; }
+
+    template <typename T>
+    static inline T* get_object(int idx) {
+        return reinterpret_cast<T*>( gRedo.per->objects[idx].pload() );
+    }
+
+    template <typename T>
+    static inline void put_object(int idx, T* obj) {
+        gRedo.per->objects[idx].pstore(obj);
+    }
+
+
+    template<typename R,class F>
+    R ns_read_transaction(F&& func) {
+        if (tl_nested_read_trans > 0) {
+            return (R)func();
+        }
+        int tid = ThreadRegistry::getTID();
+        ++tl_nested_read_trans;
+        for (int i=0; i < MAX_READ_TRIES + 2; i++) {
+
+            if (i == MAX_READ_TRIES) { // enqueue read-only operation as if it was a mutation
+                auto oldfunc = enqueuers[tid].load(std::memory_order_relaxed);
+                std::function<uint64_t()>* myfunc = (std::function<uint64_t()>*)new std::function<R()>(func);
+                enqueuers[tid].store(myfunc, std::memory_order_relaxed);
+                if (oldfunc != nullptr) hpMut.retire(oldfunc, tid);
+                const bool newrequest = !announce[tid].load();
+                announce[tid].store(newrequest); // seq-cst store
+            }
+            SeqTidIdx cComb = per->curComb.load();
+            const int curCombIndex = sti2idx(cComb);
+            Combined* lcomb = &combs[curCombIndex];
+
+            if (lcomb->rwLock.sharedTryLock(tid)) {
+                SeqTidIdx ticket = lcomb->head.load();
+                if (sti2seq(ticket) == sti2seq(cComb) && cComb == per->curComb.load() ) {
+                    tlocal.tl_cx_size = curCombIndex*g_main_size;
+                    auto ret = func();
+                    lcomb->rwLock.sharedUnlock(tid);
+                    SeqTidIdx ringtail = ring[sti2seq(ticket)%RINGSIZE].load();
+                    if(sti2seq(ringtail) < sti2seq(ticket)){
+                        PWB(&per->curComb);
+                        PSYNC();
+                    }
+                    --tl_nested_read_trans;
+                    tlocal.tl_cx_size = 0;
+                    return (R)ret;
+                }
+                lcomb->rwLock.sharedUnlock(tid);
+            }
+        }
+        --tl_nested_read_trans;
+        PWB(&per->curComb);
+        PSYNC();
+        SeqTidIdx cComb = per->curComb.load();
+        const int combIndex = sti2idx(cComb);
+        Combined* comb = &combs[combIndex];
+        SeqTidIdx t = comb->head.load();
+        SeqTidIdx combSeq = sti2seq(cComb);
+        if(sti2seq(t)!=combSeq){
+            t = ring[combSeq%RINGSIZE].load();
+        }
+
+        State* tstate = &sauron[sti2tid(t)].states[sti2idx(t)];
+
+        return (R)tstate->results[tid].load();
+    }
+
+    bool makeCopy(Combined* newComb, int tid){
+        START_TIME();
+        SeqTidIdx initComb = per->curComb.load();
+        uint64_t initCombSeq = sti2seq(initComb);
+        newComb->head.store(makeSeqTidIdx(0, 1, 0));
+        for(int i=0;i<2;i++){
+            int lCombIndex = sti2idx(initComb);
+            Combined* lcomb = &combs[lCombIndex];
+
+            SeqTidIdx head = lcomb->head.load();
+            if(initComb!=per->curComb.load()) {
+                initComb = per->curComb.load();
+                if(sti2seq(initComb)>= initCombSeq+2) {
+                    END_TIME(0);
+                    return false;
+                }
+                continue;
+            }
+
+            States* tail_states = &sauron[sti2tid(head)];
+            State* tail_state = &tail_states->states[sti2idx(head)];
+            bool an = announce[tid].load(std::memory_order_relaxed);
+
+            if(an == tail_state->applied[tid].load()){
+                if(initComb==per->curComb.load()) {
+                    END_TIME(0);
+                    return false;
+                }
+                initComb = per->curComb.load();
+                if(sti2seq(initComb)>= initCombSeq+2) {
+                    END_TIME(0);
+                    return false;
+                }
+                continue;
+            }
+
+            if(!copyFromTo(lcomb->root, newComb->root, lCombIndex, initComb, tid)){
+                initComb = per->curComb.load();
+                if(sti2seq(initComb)>= initCombSeq+2) {
+                    END_TIME(0);
+                    return false;
+                }
+                continue;
+            }
+            newComb->flushcopy = true;
+            tlocal.copy = true;
+            newComb->head.store(head);
+            END_TIME(0);
+            return true;
+        }
+        assert(false);
+        return false;
+    }
+
+    /*
+    bool makeCopy(Combined* newComb, int tid){
+        int lCombIndex;
+        if((lCombIndex = getCombined(tid)) == -1) {
+            newComb->head.store(makeSeqTidIdx(0, 1, 0),std::memory_order_relaxed);
+            return false;
+        }
+        Combined* lcomb = &combs[lCombIndex];
+        if(!copyFromTo(lcomb->root, newComb->root, lCombIndex)){
+            newComb->head.store(makeSeqTidIdx(0, 1, 0),std::memory_order_relaxed);
+            lcomb->rwLock.sharedUnlock(tid);
+            return false;
+        }
+        newComb->head.store(lcomb->head.load(),std::memory_order_relaxed);
+        newComb->flushcopy = true;
+        tlocal.copy = true;
+        lcomb->rwLock.sharedUnlock(tid);
+        return true;
+    }*/
+
+    int getNewComb(uint64_t cComb, const int tid) {
+        unsigned int mThreads = ThreadRegistry::getMaxThreads();
+        if(mThreads>1){
+            SeqTidIdx curC = per->curComb.load();
+            int start = sti2idx(curC)+1;
+            for(int i=start;i<MAX_COMBS;i++){
+                SeqTidIdx curC = per->curComb.load();
+                if (cComb!=curC) return -1;
+                if (combs[i].rwLock.exclusiveTryLock(tid)) return i;
+            }
+        }
+
+        auto _startTime = steady_clock::now();
+
+        if(copyTime.load()==0us){
+            for (int i = 0; i < MAX_COMBINEDS; i++) {
+                SeqTidIdx curC = per->curComb.load();
+                if (cComb!=curC) return -1;
+                if (combs[i].rwLock.exclusiveTryLock(tid)) return i;
+            }
+        }
+
+        // Now yield until time is over (or half the time?)
+        auto endTime = steady_clock::now();
+        microseconds timeus = duration_cast<microseconds>(endTime-_startTime);
+
+        while (timeus < copyTime.load()*4) {
+            for (int i = 0; i < MAX_COMBS; i++) {
+                SeqTidIdx curC = per->curComb.load();
+                if (cComb!=curC) {
+                    END_TIME(9);
+                    return -1;
+                }
+                if (combs[i].rwLock.exclusiveTryLock(tid)) {
+                    END_TIME(9);
+                    return i;
+                }
+            }
+            if( mThreads > NUM_CORES )
+                std::this_thread::yield();
+            endTime = steady_clock::now();
+            timeus = duration_cast<microseconds>(endTime-_startTime);
+        }
+        END_TIME(9);
+        // Now scan to the end (there can be multiple ones repeating on the first 4)
+        for (int i = 0; i < MAX_COMBINEDS; i++) {
+            SeqTidIdx curC = per->curComb.load();
+            if (cComb!=curC) return -1;
+            if (combs[i].rwLock.exclusiveTryLock(tid)) return i;
+        }
+        return -1;
+    }
+
+    // Random number generator used by the backoff scheme
+    inline uint64_t marsagliaXORV(uint64_t x) {
+        if (x == 0) x = 1;
+        x ^= x << 6;
+        x ^= x >> 21;
+        x ^= x << 7;
+        return x;
+    }
+
+    // Non-static thread-safe read-write transaction.
+    // Progress: wait-free
+    template<typename R, class F> R ns_write_transaction(F&& func) {
+        START_TIME();
+        // Call lambda directly if we're already inside a transaction
+        if (tl_nested_write_trans > 0) return (R)func();
+        ++tl_nested_write_trans;
+        // Encapsulate the lambda inside a std::function object and publish a pointer to the std::function
+        const int tid = ThreadRegistry::getTID();
+        auto oldfunc = enqueuers[tid].load(std::memory_order_relaxed);
+        std::function<uint64_t()>* myfunc = (std::function<uint64_t()>*)new std::function<R()>(func);
+        enqueuers[tid].store(myfunc, std::memory_order_relaxed);
+        const bool newrequest = !announce[tid].load(std::memory_order_relaxed);
+        announce[tid].store(newrequest);   // seq-cst store
+        uint64_t initCombSeq = sti2seq(per->curComb.load());
+        // Retire the std::function of the previous tx
+        if (oldfunc != nullptr) hpMut.retire(oldfunc, tid);
+
+        Combined* newComb = nullptr;
+        int newCombIndex = 0;
+        States* newStates = &sauron[tid];
+        State* newState = &newStates->states[newStates->lastIdx];
+        //used for logging
+        tlocal.st = newState;
+        for (int iter = 0; iter < 2; iter++) {
+            SeqTidIdx cComb = per->curComb.load();
+            uint64_t seqCComb = sti2seq(cComb);
+            Combined* lcomb = &combs[sti2idx(cComb)];
+            SeqTidIdx ltail = lcomb->head.load();
+            if(seqCComb >= initCombSeq+2) break;
+
+            if (cComb != per->curComb.load()) continue;
+            States* cCombStates = &sauron[sti2tid(ltail)];
+            State* cCombState = &cCombStates->states[sti2idx(ltail)];
+
+            if(newrequest == cCombState->applied[tid].load()){
+                if(cComb == per->curComb.load()) break;
+                continue;
+            }
+
+            SeqTidIdx newTicket = makeSeqTidIdx(seqCComb+1, (uint64_t)tid, newStates->lastIdx);
+            newState->ticket.store(newTicket);
+            newState->logTail = &newState->logHead;
+            newState->lSize = 0;
+            newState->numCL = 0;
+            newState->logTailCL = &newState->logHeadCL;
+            // Copy the contents of the current State into the new State
+            newState->copyFrom(cCombState);
+            newState->logSize.store(0);
+
+            if(cComb != per->curComb.load()) continue;
+            SeqTidIdx ringtail = ring[seqCComb%RINGSIZE].load();
+            if(ltail != ringtail){
+                if(sti2seq(ringtail) > seqCComb) continue;
+                //advance tail like Michael and Scott
+                ring[seqCComb%RINGSIZE].compare_exchange_strong(ringtail, ltail);
+            }
+
+            if(newComb == nullptr){
+                newCombIndex = getNewComb(cComb, tid);
+                if(newCombIndex==-1) continue;
+            }
+            newComb = &combs[newCombIndex];
+            tlocal.tl_cx_size = newCombIndex*g_main_size;
+
+            //apply missing redo log
+            SeqTidIdx lastAppliedTicket = newComb->head.load();
+            tlocal.copy = newComb->flushcopy;
+
+            if(lastAppliedTicket == makeSeqTidIdx(0, 1, 0)){
+                if(!makeCopy(newComb, tid)) break;
+            }else{
+                if( apply_redologs(newComb, initCombSeq, lastAppliedTicket, ltail, tid)==nullptr) break;
+            }
+
+            if(cComb != per->curComb.load()) continue;
+
+            //optimization
+            //if (seqltail != sti2seq(ring[seqltail%RINGSIZE].load())) break;
+
+            // Now newComb is as up to date as curComb
+            // Help other requests, starting from zero
+            START_TIMEST();
+            bool atleastone = false;
+            for (uint64_t i = 0; i < maxThreads; i++) {
+                // Check if it is an open request
+
+                bool applied = newState->applied[i].load();
+                bool ann = announce[i].load();
+                if (ann == applied) continue;
+                // Apply the mutation and save the result
+                std::function<uint64_t()>* mutation = hpMut.protectPtr(kHpMut, enqueuers[i].load(), tid);
+                if (mutation != enqueuers[i].load()) break;
+                if (applied == announce[i].load()) continue;
+                if(cComb != per->curComb.load()) break;
+
+                atleastone = true;
+                newState->results[i].store((*mutation)(),std::memory_order_release);
+                newState->applied[i].store(!applied);
+            }
+            END_TIMEST(8);
+
+            bool undo = false;
+            if(atleastone && cComb != per->curComb.load()){
+                apply_undolog(newState);
+                undo = true;
+            }
+
+            if(!tlocal.copy){
+                flushDeferredPWBs(newState);
+            }else{
+                newComb->flushcopy = true;
+            }
+            if(undo) continue;
+            if(!atleastone) continue;
+
+            if(tlocal.copy){
+                if(!flushCopy(newComb->root, esloco.getUsedSize())){
+                    apply_undolog(newState);
+                    break;
+                }
+                newComb->flushcopy = false;
+                tlocal.copy = false;
+            }
+
+            // curComb must be flushed before we make our changes visible (on curComb)
+            PWB(&per->curComb);
+            newState->logSize.store(newState->lSize,std::memory_order_relaxed);
+            newComb->head.store(newTicket,std::memory_order_relaxed);
+            newComb->rwLock.downgrade();
+            SeqTidIdx newcComb = makeSeqTidIdx(sti2seq(cComb)+1, (uint64_t)tid, (uint64_t)newCombIndex);
+            //this PFENCE is ommited because it will be executed per->curComb.compare_exchange_strong(tmp, newCombIndex) that
+            // will issue the necessary fence that orders previous PWB and the store on curComb
+            //PFENCE();
+            if (per->curComb.compare_exchange_strong(cComb, newcComb)){
+                lcomb->rwLock.setReadUnlock();
+                SeqTidIdx oldTicket = ring[(seqCComb+1)%RINGSIZE].load();
+                if(sti2seq(oldTicket) < seqCComb+1){
+                    PWB(&per->curComb);
+                    //PSYNC();
+                    ring[(seqCComb+1)%RINGSIZE].compare_exchange_strong(oldTicket, newTicket);
+                }
+                newStates->lastIdx++;
+                if(newStates->lastIdx == STATESSIZE) newStates->lastIdx = 0;
+                hpMut.clear(tid);
+                --tl_nested_write_trans;
+                tlocal.tl_cx_size = 0;
+                tlocal.st = nullptr;
+
+                END_TIMEF(12);
+                return (R)newState->results[tid].load();
+            }
+            apply_undolog(newState);
+            flushDeferredPWBs(newState);
+            newComb->head.store(ltail,std::memory_order_release);
+            newComb->rwLock.setReadUnlock();
+            newComb = nullptr;
+        }
+        hpMut.clear(tid);
+        if(newComb!=nullptr){
+            newComb->rwLock.exclusiveUnlock();
+        }
+        --tl_nested_write_trans;
+        tlocal.tl_cx_size = 0;
+        tlocal.st = nullptr;
+
+        SeqTidIdx cComb = per->curComb.load();
+        const int combIndex = sti2idx(cComb);
+        Combined* comb = &combs[combIndex];
+        SeqTidIdx t = comb->head.load();
+        SeqTidIdx combSeq = sti2seq(cComb);
+        if(sti2seq(t)!=combSeq){
+            t = ring[combSeq%RINGSIZE].load();
+        }else{
+            SeqTidIdx oldTicket = ring[combSeq%RINGSIZE].load();
+            if(sti2seq(oldTicket) < combSeq){
+                PWB(&per->curComb);
+                //PSYNC();
+                ring[combSeq%RINGSIZE].compare_exchange_strong(oldTicket, t);
+            }
+        }
+        States* tstates = &sauron[sti2tid(t)];
+        State* tstate = &tstates->states[sti2idx(t)];
+
+        END_TIMEF(12);
+        return (R)tstate->results[tid].load();
+    }
+
+
+    template <typename T, typename... Args> static T* tmNew(Args&&... args) {
+        RedoTimed& r = gRedo;
+#ifdef USE_ESLOCO
+        void* addr = r.esloco.malloc(sizeof(T));
+        assert(addr != nullptr);
+#else
+        void* addr = mspace_malloc( ((uint8_t*)(r.per->ms))+tlocal.tl_cx_size, sizeof(T));
+        assert(addr != 0);
+#endif
+        T* ptr = new (addr) T(std::forward<Args>(args)...); // placement new
+        if (r.enableAllocStatistics) {
+            r.statsAllocBytes += sizeof(T);
+            r.statsAllocNum++;
+            r.statsSet.insert({addr, sizeof(T)});
+        }
+        return ptr;
+    }
+
+
+    /*
+     * De-allocator
+     * Calls destructor of T and then de-allocate the memory using the internal allocator (Doug Lea or EsLoco)
+     */
+    template<typename T> static void tmDelete(T* obj) {
+        if (obj == nullptr) return;
+        obj->~T();
+        RedoTimed& r = gRedo;
+#ifdef USE_ESLOCO
+        r.esloco.free(obj);
+#else
+        mspace_free( ((uint8_t*)(r.per->ms))+tlocal.tl_cx_size,obj);
+#endif
+        if (r.enableAllocStatistics) {
+            auto search = r.statsSet.find({obj,0});
+            if (search == r.statsSet.end()) {
+                std::cout << "Attemped free() of unknown address\n";
+                assert(false);
+                return;
+            }
+            r.statsAllocBytes -= search->size;
+            r.statsAllocNum--;
+            r.statsSet.erase(*search);
+        }
+    }
+
+    /* Allocator for arrays and C methods */
+    static void* pmalloc(size_t size) {
+        RedoTimed& r = gRedo;
+#ifdef USE_ESLOCO
+        void* addr = r.esloco.malloc(size);
+        assert(addr != nullptr);
+#else
+        void* addr = mspace_malloc( ((uint8_t*)(r.per->ms))+tlocal.tl_cx_size , size);
+        assert(addr != 0);
+#endif
+        assert (addr != 0);
+        if (r.enableAllocStatistics) {
+            r.statsAllocBytes += size;
+            r.statsAllocNum++;
+            r.statsSet.insert({addr, size});
+        }
+        return addr;
+    }
+
+    /* De-allocator for arrays and C methods */
+    static void pfree(void* ptr) {
+        RedoTimed& r = gRedo;
+#ifdef USE_ESLOCO
+        r.esloco.free(ptr);
+#else
+        mspace_free( ((uint8_t*)(r.per->ms))+tlocal.tl_cx_size, ptr);
+#endif
+        if (r.enableAllocStatistics) {
+            auto search = r.statsSet.find({ptr,0});
+            if (search == r.statsSet.end()) {
+                std::cout << "Attemped pfree() of unknown address\n";
+                assert(false);
+                return;
+            }
+            r.statsAllocBytes -= search->size;
+            r.statsAllocNum--;
+            r.statsSet.erase(*search);
+        }
+    }
+
+    // Wrappers to non-static functions
+    template<typename R,class F> inline static R readTx(F&& func) { return gRedo.ns_read_transaction<R>(func); }
+    template<typename R,class F> inline static R updateTx(F&& func) { return gRedo.ns_write_transaction<R>(func); }
+};
+
+
+// Store interposing
+template<typename T> inline void persist<T>::pstore(T newVal) {
+    uint8_t* valaddr = (uint8_t*)&val;
+    const uint64_t offset = tlocal.tl_cx_size;
+    bool copy = tlocal.copy;
+    bool sameAddr = false;
+    if (offset != 0 && ADDR_IS_IN_MAIN(valaddr)) {
+        uint64_t oldval = (uint64_t)*reinterpret_cast<T*>( valaddr + offset );
+        if (oldval != (uint64_t)newVal) {
+            sameAddr = !gRedo.addAddrIfAbsent((RedoTimed::State*)tlocal.st, valaddr, oldval, (uint64_t)newVal);
+            *reinterpret_cast<T*>( valaddr + offset ) = newVal;
+        }
+        if (!copy && !sameAddr) gRedo.addIfAbsent((RedoTimed::State*)tlocal.st,valaddr);
+    } else {
+        if (ADDR_IS_IN_REGION(valaddr)) {
+            if((uint64_t)val != (uint64_t)newVal){
+                sameAddr = !gRedo.addAddrIfAbsent((RedoTimed::State*)tlocal.st, valaddr - offset, (uint64_t)val, (uint64_t)newVal);
+                val = newVal;
+            }
+            if (!copy && !sameAddr) gRedo.addIfAbsent((RedoTimed::State*)tlocal.st,valaddr - offset);
+        } else {
+            val = newVal;
+        }
+    }
+}
+}
+#endif   // _REDOTIMED_PERSISTENCY_H_

@@ -1,0 +1,12 @@
+/ut1
+/ut2
+/db_bench_romlog
+/db_bench_cxredo
+/db_bench_cxredotimed
+/db_bench_redotimedhash
+/db_bench_redotimedhash_castor
+/recover_rocksdb
+/recover_redodb
+/db_bench_redo
+/db_bench_redoopt
+/db_bench_redotimed

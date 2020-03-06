@@ -1,0 +1,36 @@
+diff --git a/src/libpmem/libpmem.c b/src/libpmem/libpmem.c
+index 9fac6de52..dda7786fa 100644
+--- a/src/libpmem/libpmem.c
++++ b/src/libpmem/libpmem.c
+@@ -42,6 +42,8 @@
+ #include "pmem.h"
+ #include "pmemcommon.h"
+ 
++__thread uint64_t tl_num_pwbs = 0;
++
+ /*
+  * libpmem_init -- load-time initialization for libpmem
+  *
+diff --git a/src/libpmem/x86_64/flush.h b/src/libpmem/x86_64/flush.h
+index 32690c6b6..441af48cd 100644
+--- a/src/libpmem/x86_64/flush.h
++++ b/src/libpmem/x86_64/flush.h
+@@ -44,15 +44,18 @@
+ #define pmem_clflushopt _mm_clflushopt
+ #define pmem_clwb _mm_clwb
+ #else
++extern __thread uint64_t tl_num_pwbs;
+ /*
+  * The x86 memory instructions are new enough that the compiler
+  * intrinsic functions are not always available.  The intrinsic
+  * functions are defined here in terms of asm statements for now.
+  */
+ #define pmem_clflushopt(addr)\
++    tl_num_pwbs++; \
+ 	asm volatile(".byte 0x66; clflush %0" : "+m" \
+ 		(*(volatile char *)(addr)));
+ #define pmem_clwb(addr)\
++    tl_num_pwbs++; \
+ 	asm volatile(".byte 0x66; xsaveopt %0" : "+m" \
+ 		(*(volatile char *)(addr)));
+ #endif /* _MSC_VER */
