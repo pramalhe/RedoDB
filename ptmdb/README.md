@@ -1,7 +1,7 @@
 # Redo DB #
 A persistent in-memory key-value store for usage with NVMM
 RedoDB uses the same API as RocksDB.
-At the core of RedoDB is an Hash Map data structure protected with the RomulusLog persistent transactional memory (PTM).
+At the core of RedoDB is an Hash Map data structure protected with the RedoOpt PTM persistent transactional memory (PTM).
 
 
 ## How to run ##
